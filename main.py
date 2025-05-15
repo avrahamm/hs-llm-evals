@@ -15,10 +15,20 @@ from qdrant_client.http.models import Distance, VectorParams
 # ---------------------------
 from langfuse.decorators import observe, langfuse_context
 from langfuse.callback import CallbackHandler
+from langfuse import Langfuse
 import uuid
+
+
 
 # Load environment variables from .env file
 dotenv.load_dotenv()
+
+# Initialize Langfuse
+langfuse_client = Langfuse(
+    public_key=os.getenv("LANGFUSE_PUBLIC_KEY"),
+    secret_key=os.getenv("LANGFUSE_SECRET_KEY"),
+    host=os.getenv("LANGFUSE_HOST"),
+)
 
 session_name = f"session-{uuid.uuid4().hex[:8]}"
 trace_name = "ai-response"
@@ -194,6 +204,23 @@ def end_session_tool(session_status: str):
             prompt,
             config=config,
         ).content
+
+        # collect feedback
+        # retrieve all traces with name `main`
+        # associate the score with the latest trace (`traces[0]`) and push score to Langfuse
+        traces = langfuse_client.fetch_traces(name="main").data
+        trace = langfuse_client.fetch_trace(id=traces[0].id)
+        print(trace)
+        # [TraceWithDetails(id='7d7f5199-ed3d-439d-9618-cdf21223cc5f', ... createdAt='2025-03-26T08:28:47.870Z')]
+        feedback = input("Rate the model's responses from 1 to 5 (e.g., 3 for three stars):")
+        comment = input("Please give us a reason for your answer. This will help us improve:")
+        langfuse_client.score(
+            trace_id=trace.data.id,
+            name="usefulness",
+            value= float(feedback),
+            comment=comment
+        )
+
         print(goodbye_message)
 
     except Exception as e:
