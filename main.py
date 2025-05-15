@@ -12,8 +12,23 @@ from langchain_qdrant import QdrantVectorStore
 from qdrant_client import QdrantClient
 from qdrant_client.http.models import Distance, VectorParams
 
+# ---------------------------
+from langfuse.decorators import observe, langfuse_context
+from langfuse.callback import CallbackHandler
+import uuid
+
 # Load environment variables from .env file
 dotenv.load_dotenv()
+
+session_name = f"session-{uuid.uuid4().hex[:8]}"
+trace_name = "ai-response"
+langfuse_handler = CallbackHandler(
+    public_key=os.getenv("LANGFUSE_PUBLIC_KEY"),
+    secret_key=os.getenv("LANGFUSE_SECRET_KEY"),
+    host=os.getenv("LANGFUSE_HOST"),
+    trace_name=trace_name,
+    # other params such as trace_name, user_id, version, etc
+)
 
 # Initialize the LLM with OpenAI API credentials (substitute for other models)
 llm = ChatOpenAI(
@@ -34,7 +49,7 @@ embeddings_model = OpenAIEmbeddings(
 # ---------------------------
 # Load JSON Data and Build Qdrant Vector Store
 # ---------------------------
-
+@observe
 def embed_documents(json_path: str):
     """
     Load JSON data from the smartphones.json file and convert each entry to a Document.
@@ -45,6 +60,9 @@ def embed_documents(json_path: str):
         Qdrant vector store A Qdrant vector store built from the smartphone documents,
                 or an empty list if an error occurs.
     """
+    langfuse_context.update_current_trace(
+        session_id=session_name,
+    )
     try:
         with open(json_path, "r") as f:
             data = json.load(f)
@@ -141,7 +159,6 @@ def smartphone_info_tool(model: str) -> str:
         print(f"Error during smartphone information retrieval for model {model}: {e}")
         return f"Error during smartphone information retrieval: {e}"
 
-
 @tool("EndSession")
 def end_session_tool(session_status: str):
     """
@@ -163,7 +180,20 @@ def end_session_tool(session_status: str):
     )
 
     try:
-        goodbye_message = llm.invoke(prompt).content
+        # update the trace
+        langfuse_context.update_current_trace(
+            session_id=session_name
+        )
+        # get the current Langfuse handler
+        from_context_langfuse_handler = langfuse_context.get_current_langchain_handler()
+        config = {
+            "callbacks": [from_context_langfuse_handler],
+            "run_name": "goodbye",
+        }
+        goodbye_message = llm.invoke(
+            prompt,
+            config=config,
+        ).content
         print(goodbye_message)
 
     except Exception as e:
@@ -202,7 +232,17 @@ def generate_context(llm_tools):
 # ---------------------------
 # Main Conversation Loop
 # ---------------------------
+@observe
 def main():
+    # update the trace
+    langfuse_context.update_current_trace(
+        session_id=session_name
+    )
+    # get the current Langfuse handler
+    from_context_langfuse_handler = langfuse_context.get_current_langchain_handler()
+    config = {
+        "callbacks": [from_context_langfuse_handler],
+    }
     # List of available tools
     tools = [smartphone_info_tool, end_session_tool]
 
@@ -248,7 +288,11 @@ def main():
 
             chain = prompt | llm_with_tools | generate_context
 
-            context = chain.invoke({"chat_history": chat_history, "user_input": user_input})
+            config["run_name"] = "context"
+            context = chain.invoke(
+                {"chat_history": chat_history, "user_input": user_input},
+                config=config,
+            )
 
             final_template = PromptTemplate.from_template(
                 f"Conversation History:\n{chat_history}\n\n"
@@ -257,7 +301,11 @@ def main():
                 "Your analysis should always be simple and never exceed 100 words. "
             )
 
-            response = llm.invoke(final_template.invoke({"chat_history": chat_history, "user_input": user_input, "context": context}))
+            config["run_name"] = "final_response"
+            response = llm.invoke(
+                final_template.invoke({"chat_history": chat_history, "user_input": user_input, "context": context}),
+                config=config,
+            )
             conversation.append({"role": "assistant", "content": response.content})
             print(f"System: {response.content}")
 
