@@ -18,7 +18,17 @@ from langfuse.callback import CallbackHandler
 from langfuse import Langfuse
 import uuid
 
+from ragas import EvaluationDataset
 
+from ragas import evaluate
+from ragas.llms import LangchainLLMWrapper
+from ragas.metrics import (
+    Faithfulness,
+    ResponseRelevancy,
+    LLMContextPrecisionWithoutReference,
+)
+
+# {'context_recall': 1.0000, 'faithfulness': 0.9000}
 
 # Load environment variables from .env file
 dotenv.load_dotenv()
@@ -210,7 +220,7 @@ def end_session_tool(session_status: str):
         # associate the score with the latest trace (`traces[0]`) and push score to Langfuse
         traces = langfuse_client.fetch_traces(name="main").data
         trace = langfuse_client.fetch_trace(id=traces[0].id)
-        print(trace)
+        # print(trace)
         # [TraceWithDetails(id='7d7f5199-ed3d-439d-9618-cdf21223cc5f', ... createdAt='2025-03-26T08:28:47.870Z')]
         feedback = input("Rate the model's responses from 1 to 5 (e.g., 3 for three stars):")
         comment = input("Please give us a reason for your answer. This will help us improve:")
@@ -221,6 +231,7 @@ def end_session_tool(session_status: str):
             comment=comment
         )
 
+        score_with_ragas()
         print(goodbye_message)
 
     except Exception as e:
@@ -255,6 +266,79 @@ def generate_context(llm_tools):
             generated_context.append("No tool found for this query.")
             sys.exit(0)
     return generated_context
+
+
+@observe(name="RagasEvaluation")
+def score_with_ragas():
+    # langfuse update trace
+    langfuse_context.update_current_trace(
+        session_id=session_name
+    )
+
+    langfuse_handler = (
+        langfuse_context.get_current_langchain_handler()
+    )
+
+    traces = langfuse_client.fetch_traces(name="main").data
+    current_trace = langfuse_client.fetch_trace(traces[0].id)
+    observations = current_trace.data.observations
+
+    # Build a single sample dictionary.
+    sample = {}
+
+    for obs in observations:
+        if obs.name == 'context':
+            sample['user_input'] = obs.input.get('user_input') if isinstance(obs.input, dict) else obs.input
+        if obs.name == 'final_response':
+            sample['response'] = obs.output['content']
+        if obs.name == "SmartphoneInfo":
+            sample['retrieved_contexts'] = [obs.output['content']]
+
+    sample['trace_id'] = current_trace.data.id
+    evaluation_dataset = [sample]
+    evaluation_dataset = EvaluationDataset.from_list(evaluation_dataset)
+
+    evaluator_llm = LangchainLLMWrapper(llm)
+    metrics = [
+        Faithfulness(),
+        ResponseRelevancy(),
+        LLMContextPrecisionWithoutReference(),
+    ]
+
+    try:
+        scores = evaluate(dataset=evaluation_dataset,
+                          metrics=metrics,
+                          llm=evaluator_llm
+                          )
+        print(scores)
+        # {'faithfulness': 0.4706, 'answer_relevancy': 0.9420, 'llm_context_precision_without_reference': 1.0000}
+    except Exception:
+        raise Exception(
+            "Ragas evaluation failed. Please check your model and try again."
+        )
+
+    langfuse_client.score(
+        trace_id=current_trace.data.id,
+        name="Ragas Nvidia Context Relevance",
+        # value= 1.00,
+        value=scores.scores[0]['llm_context_precision_without_reference'],
+        comment="Ragas Nvidia Context Relevance"
+    )
+
+    langfuse_client.score(
+        trace_id=current_trace.data.id,
+        name="Ragas Faithfulness",
+        value=scores.scores[0]['faithfulness'],
+        comment="Ragas Faithfulness"
+    )
+
+    langfuse_client.score(
+        trace_id=current_trace.data.id,
+        name="Ragas Response Relevancy",
+        value=scores.scores[0]['answer_relevancy'],
+        comment="Ragas Response Relevancy"
+    )
+
 
 # ---------------------------
 # Main Conversation Loop
